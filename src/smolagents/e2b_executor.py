@@ -19,7 +19,7 @@ import pickle
 import re
 import textwrap
 from io import BytesIO
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
 
@@ -36,8 +36,31 @@ except ModuleNotFoundError:
     pass
 
 
+class AgentCallInterruption(Exception):
+    def __init__(
+        self,
+        agent_name: str,
+        args: tuple,
+        kwargs: dict,
+        line_number: Optional[int] = None,
+    ):
+        self.agent_name = agent_name
+        self.args = args
+        self.kwargs = kwargs
+        self.line_number = line_number
+        super().__init__(
+            f"Sub-agent call interruption for '{agent_name}' at line {line_number}"
+        )
+
+
 class E2BExecutor:
-    def __init__(self, additional_imports: List[str], tools: List[Tool], logger):
+    def __init__(
+        self,
+        additional_imports: List[str],
+        tools: List[Tool],
+        logger,
+        managed_agents: Optional[Dict[str, Any]],
+    ):
         self.logger = logger
         try:
             from e2b_code_interpreter import Sandbox
@@ -48,6 +71,7 @@ class E2BExecutor:
         self.logger = logger
         self.logger.log("Initializing E2B executor, hold on...")
 
+        self.managed_agents = managed_agents or {}
         self.custom_tools = {}
         self.final_answer = False
         self.final_answer_pattern = re.compile(r"final_answer\((.*?)\)")
@@ -59,9 +83,11 @@ class E2BExecutor:
         #     timeout=300
         # )
         # print("Installation of agents package finished.")
-        additional_imports = additional_imports + ["smolagents"]
+        additional_imports = list(set(additional_imports + ["smolagents", "sys"]))
         if len(additional_imports) > 0:
-            execution = self.sbx.commands.run("pip install " + " ".join(additional_imports))
+            execution = self.sbx.commands.run(
+                "pip install " + " ".join(additional_imports)
+            )
             if execution.error:
                 raise Exception(f"Error installing dependencies: {execution.error}")
             else:
@@ -75,7 +101,9 @@ class E2BExecutor:
             tool_code += f"\n{tool.name} = {tool.__class__.__name__}()\n"
             tool_codes.append(tool_code)
 
-        tool_definition_code = "\n".join([f"import {module}" for module in BASE_BUILTIN_MODULES])
+        tool_definition_code = "\n".join(
+            [f"import {module}" for module in BASE_BUILTIN_MODULES]
+        )
         tool_definition_code += textwrap.dedent(
             """
         class Tool:
@@ -87,6 +115,14 @@ class E2BExecutor:
         """
         )
         tool_definition_code += "\n\n".join(tool_codes)
+        for agent_name in self.managed_agents.keys():
+            tool_definition_code += "\n\n" + textwrap.dedent(
+                f"""
+                def {agent_name}(*args, **kwargs):
+                    line_no = sys._getframe(1).f_lineno
+                    raise AgentCallInterruption("sub_agent", args, kwargs, line_number=line_no)
+                """
+            )
 
         tool_definition_execution = self.run_code_raise_errors(tool_definition_code)
         self.logger.log(tool_definition_execution.logs)
@@ -94,9 +130,7 @@ class E2BExecutor:
     def run_code_raise_errors(self, code: str):
         if self.final_answer_pattern.search(code) is not None:
             self.final_answer = True
-        execution = self.sbx.run_code(
-            code,
-        )
+        execution = self.sbx.run_code(code)
         if execution.error:
             execution_logs = "\n".join([str(log) for log in execution.logs.stdout])
             logs = execution_logs
@@ -128,7 +162,49 @@ locals().update({key: value for key, value in pickle_dict.items()})
             execution_logs = "\n".join([str(log) for log in execution.logs.stdout])
             self.logger.log(execution_logs, 1)
 
-        execution = self.run_code_raise_errors(code_action)
+        while True:
+            try:
+                execution = self.run_code_raise_errors(code_action)
+                break
+            except AgentCallInterruption as handoff:
+                self.logger.log(
+                    f"Running sub-agent '{handoff.agent_name}' locally with args {handoff.args} and kwargs {handoff.kwargs}",
+                    level=0,
+                )
+                result = self.managed_agents[handoff.agent_name](
+                    *handoff.args, **handoff.kwargs
+                )
+                additional_args[handoff.agent_name] = result
+
+                # Re-upload the updated state to the sandbox.
+                import tempfile
+
+                with tempfile.NamedTemporaryFile() as f:
+                    pickle.dump(additional_args, f)
+                    f.flush()
+                    with open(f.name, "rb") as file:
+                        self.sbx.files.write("/home/state.pkl", file)
+                self.logger.log(
+                    f"Sub-agent '{handoff.agent_name}' executed locally; resuming sandbox execution.",
+                    level=0,
+                )
+                # Replace the call to the sub-agent with the result of the local execution.
+                lines = code_action.splitlines()
+                if handoff.line_number is not None and 0 < handoff.line_number <= len(
+                    lines
+                ):
+                    variable = lines[handoff.line_number - 1].split("=")[0].strip()
+                    assignment_line = f"{variable} = {repr(result)}"
+                    code_action = "\n".join(
+                        [assignment_line] + lines[handoff.line_number - 1 :]
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid line number {handoff.line_number} for code action:\n{code_action}"
+                    )
+                # Execute the rest of the code action.
+                continue
+
         execution_logs = "\n".join([str(log) for log in execution.logs.stdout])
         if not execution.results:
             return None, execution_logs, self.final_answer
@@ -138,8 +214,14 @@ locals().update({key: value for key, value in pickle_dict.items()})
                     for attribute_name in ["jpeg", "png"]:
                         if getattr(result, attribute_name) is not None:
                             image_output = getattr(result, attribute_name)
-                            decoded_bytes = base64.b64decode(image_output.encode("utf-8"))
-                            return Image.open(BytesIO(decoded_bytes)), execution_logs, self.final_answer
+                            decoded_bytes = base64.b64decode(
+                                image_output.encode("utf-8")
+                            )
+                            return (
+                                Image.open(BytesIO(decoded_bytes)),
+                                execution_logs,
+                                self.final_answer,
+                            )
                     for attribute_name in [
                         "chart",
                         "data",
@@ -153,7 +235,11 @@ locals().update({key: value for key, value in pickle_dict.items()})
                         "text",
                     ]:
                         if getattr(result, attribute_name) is not None:
-                            return getattr(result, attribute_name), execution_logs, self.final_answer
+                            return (
+                                getattr(result, attribute_name),
+                                execution_logs,
+                                self.final_answer,
+                            )
             if self.final_answer:
                 raise ValueError("No main result returned by executor!")
             return None, execution_logs, False
