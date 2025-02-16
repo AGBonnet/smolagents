@@ -54,13 +54,7 @@ class AgentCallInterruption(Exception):
 
 
 class E2BExecutor:
-    def __init__(
-        self,
-        additional_imports: List[str],
-        tools: List[Tool],
-        logger,
-        managed_agents: Optional[Dict[str, Any]],
-    ):
+    def __init__(self, additional_imports: List[str], tools: List[Tool], logger, managed_agents: Optional[Dict[str, Any]],):
         self.logger = logger
         try:
             from e2b_code_interpreter import Sandbox
@@ -83,11 +77,9 @@ class E2BExecutor:
         #     timeout=300
         # )
         # print("Installation of agents package finished.")
-        additional_imports = list(set(additional_imports + ["smolagents", "sys"]))
+        additional_imports = additional_imports + ["smolagents", "sys"]
         if len(additional_imports) > 0:
-            execution = self.sbx.commands.run(
-                "pip install " + " ".join(additional_imports)
-            )
+            execution = self.sbx.commands.run("pip install " + " ".join(additional_imports))
             if execution.error:
                 raise Exception(f"Error installing dependencies: {execution.error}")
             else:
@@ -101,9 +93,7 @@ class E2BExecutor:
             tool_code += f"\n{tool.name} = {tool.__class__.__name__}()\n"
             tool_codes.append(tool_code)
 
-        tool_definition_code = "\n".join(
-            [f"import {module}" for module in BASE_BUILTIN_MODULES]
-        )
+        tool_definition_code = "\n".join([f"import {module}" for module in BASE_BUILTIN_MODULES])
         tool_definition_code += textwrap.dedent(
             """
         class Tool:
@@ -115,6 +105,17 @@ class E2BExecutor:
         """
         )
         tool_definition_code += "\n\n".join(tool_codes)
+        tool_definition_code += "\n\n" + textwrap.dedent(
+            """
+            class AgentCallInterruption(Exception):
+                def __init__(self, agent_name, args, kwargs, line_number=None):
+                    self.agent_name = agent_name
+                    self.args = args
+                    self.kwargs = kwargs
+                    self.line_number = line_number
+                    super().__init__(f"Sub-agent call interruption for '{agent_name}' at line {line_number}")
+            """
+        )
         for agent_name in self.managed_agents.keys():
             tool_definition_code += "\n\n" + textwrap.dedent(
                 f"""
@@ -214,14 +215,8 @@ locals().update({key: value for key, value in pickle_dict.items()})
                     for attribute_name in ["jpeg", "png"]:
                         if getattr(result, attribute_name) is not None:
                             image_output = getattr(result, attribute_name)
-                            decoded_bytes = base64.b64decode(
-                                image_output.encode("utf-8")
-                            )
-                            return (
-                                Image.open(BytesIO(decoded_bytes)),
-                                execution_logs,
-                                self.final_answer,
-                            )
+                            decoded_bytes = base64.b64decode(image_output.encode("utf-8"))
+                            return Image.open(BytesIO(decoded_bytes)), execution_logs, self.final_answer
                     for attribute_name in [
                         "chart",
                         "data",
@@ -235,11 +230,7 @@ locals().update({key: value for key, value in pickle_dict.items()})
                         "text",
                     ]:
                         if getattr(result, attribute_name) is not None:
-                            return (
-                                getattr(result, attribute_name),
-                                execution_logs,
-                                self.final_answer,
-                            )
+                            return getattr(result, attribute_name), execution_logs, self.final_answer
             if self.final_answer:
                 raise ValueError("No main result returned by executor!")
             return None, execution_logs, False
